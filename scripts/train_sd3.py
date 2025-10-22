@@ -602,11 +602,11 @@ def main(_):
 
     while True:
         #################### EVAL ####################
-        # pipeline.transformer.eval()
-        # if epoch % config.eval_freq == 0:
-        #     eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
-        # if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
-        #     save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
+        pipeline.transformer.eval()
+        if epoch % config.eval_freq == 0:
+            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
+        if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
+            save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 
         #################### SAMPLING ####################
         pipeline.transformer.eval()
