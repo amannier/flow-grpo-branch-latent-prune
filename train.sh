@@ -1,4 +1,4 @@
-HF_TOKEN="REMOVED"
+HF_TOKEN=""
 export HF_TOKEN="$HF_TOKEN"
 export HF_HOME=/mnt/bn/yiren-bytenas/yuang.ai/hf_cache
 export WANDB_API_KEY=e5a88ecf2edd32209aec732d5840a393e19ca662
