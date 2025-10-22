@@ -364,7 +364,7 @@ def main(_):
     )
     if accelerator.is_main_process:
         wandb.init(
-            project="flow_grpo_hcy",
+            project="flow_grpo_branch",
         )
         accelerator.init_trackers(
             project_name="flow-grpo",
@@ -636,6 +636,10 @@ def main(_):
                 return_tensors="pt",
             ).input_ids.to(accelerator.device)
 
+            if epoch == 0:
+                epoch += 1
+                continue
+
             # sample
             if config.sample.same_latent:
                 generator = create_generator(prompts, base_seed=epoch*10000+i)
@@ -868,10 +872,6 @@ def main(_):
         # )
         assert num_timesteps == config.sample.num_steps
 
-
-        if epoch == 0:
-            epoch += 1
-            continue
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
             # shuffle samples along batch dimension
