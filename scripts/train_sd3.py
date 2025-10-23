@@ -665,6 +665,7 @@ def main(_):
                         accelerator=accelerator,
                         timestep_to_prune=6,
                         num_to_delete_per_prompt=config.sample.num_image_per_prompt_before_pruning - config.sample.num_image_per_prompt, 
+                        unique_prompts_num=config.sample.unique_prompts,
                         epoch=epoch,
                         noise_level=config.sample.noise_level,
                         generator=generator,
