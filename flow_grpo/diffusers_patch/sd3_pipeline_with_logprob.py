@@ -259,6 +259,7 @@ def pipeline_with_logprob_hcy(
     accelerator: Optional[Accelerator] = None,
     timestep_to_prune: Optional[int] = None,
     num_to_delete_per_prompt: Optional[int] = None,
+    unique_prompts_num: Optional[int] = None,
     epoch: Optional[int] = None,
     noise_level: float = 0.7,
     latent_extract_index: int = None,
@@ -428,10 +429,9 @@ def pipeline_with_logprob_hcy(
                 # CFG只在上面的prompt_embeds添加了，所以后续重新编码prompt_embeds时候确实要手动添加neg_prompt_embed
                 neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
 
-                unique_prompts = len(list(set(prompts))) 
                 num_processes = accelerator.num_processes
 
-                left_total = latents.shape[0] * num_processes - unique_prompts * num_to_delete_per_prompt
+                left_total = latents.shape[0] * num_processes - unique_prompts_num * num_to_delete_per_prompt
                 assert left_total % num_processes == 0, f"left_total {left_total} must be divisible by world_size {num_processes}"
                 left_num_per_process = left_total // num_processes
 
