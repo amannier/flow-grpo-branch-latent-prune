@@ -31,6 +31,8 @@ from peft import LoraConfig, get_peft_model, set_peft_model_state_dict, PeftMode
 import random
 from torch.utils.data import Dataset, DataLoader, Sampler
 from flow_grpo.ema import EMAModuleWrapper
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import retrieve_timesteps
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
@@ -81,8 +83,8 @@ class DistributedKRepeatSampler(Sampler):
     def __init__(self, dataset, batch_size, k, num_replicas, rank, seed=0):
         self.dataset = dataset
         self.batch_size = batch_size  # Batch size per replica，每个进程/卡的batch大小，8
-        self.k = k                    # Number of repetitions per sample，每个样本重复次数，16
-        self.num_replicas = num_replicas  # Total number of replicas，总进程/卡数，4
+        self.k = k                    # Number of repetitions per sample，每个样本重复次数，8
+        self.num_replicas = num_replicas  # Total number of replicas，总进程/卡数，2
         self.rank = rank              # Current replica rank，当前进程/卡的编号
         self.seed = seed              # Random seed for synchronization
         
@@ -364,7 +366,7 @@ def main(_):
     )
     if accelerator.is_main_process:
         wandb.init(
-            project="flow_grpo_branch",
+            project="flow_grpo_hcy",
         )
         accelerator.init_trackers(
             project_name="flow-grpo",
@@ -600,13 +602,35 @@ def main(_):
     global_step = 0
     train_iter = iter(train_dataloader)
 
+    # 定义scorer
+    if config.pretrained.reward_model == 'pickscore':
+        from flow_grpo.pickscore_scorer import PickScoreScorer
+        scorer = PickScoreScorer(device=accelerator.device, dtype=torch.float32)
+
+    # 定义skip_scheduler
+    scheduler_kwargs = {}
+    ori_ten_timesteps = torch.tensor([1000.0000,  960.1293,  913.3490,  857.6923,  790.3683,  707.2785, 602.1506,  464.8760,  278.0488, 8.9286], device='cpu')
+    skip_scheduler_list = []
+    for skip_t_index in config.sample.skip_timesteps:
+        temp_skip_timesteps = ori_ten_timesteps[:skip_t_index+1]
+        temp_skip_schedular = FlowMatchEulerDiscreteScheduler()
+        temp_skip_timesteps, temp_num_skip_inference_steps = retrieve_timesteps(
+            temp_skip_schedular,
+            num_inference_steps=len(temp_skip_timesteps),
+            device=accelerator.device,
+            timesteps=temp_skip_timesteps,
+            sigmas=None,
+            **scheduler_kwargs,
+        )
+        skip_scheduler_list.append(temp_skip_schedular)
+
     while True:
         #################### EVAL ####################
-        pipeline.transformer.eval()
-        if epoch % config.eval_freq == 0:
-            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
-        if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
-            save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
+        # pipeline.transformer.eval()
+        # if epoch % config.eval_freq == 0:
+        #     eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
+        # if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
+        #     save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 
         #################### SAMPLING ####################
         pipeline.transformer.eval()
@@ -619,7 +643,7 @@ def main(_):
             position=0,
         ):
             train_sampler.set_epoch(epoch * config.sample.sample_batches_per_epoch + i)
-            prompts, prompt_metadata = next(train_iter) # len(prompts) = config.sample.train_batch_size = 8
+            prompts, prompt_metadata = next(train_iter) # len(prompts) = config.sample.train_batch_size = 8, unique_prompts_num = 2
 
             prompt_embeds, pooled_prompt_embeds = compute_text_embeddings( # torch.Size([config.sample.train_batch_size, 205, 4096])
                 prompts, 
@@ -636,10 +660,6 @@ def main(_):
                 return_tensors="pt",
             ).input_ids.to(accelerator.device)
 
-            if epoch == 0:
-                epoch += 1
-                continue
-
             # sample
             if config.sample.same_latent:
                 generator = create_generator(prompts, base_seed=epoch*10000+i)
@@ -649,6 +669,7 @@ def main(_):
                 with torch.no_grad():
                     images, latents, log_probs, prompts = pipeline_with_logprob_hcy(
                         pipeline,
+                        scorer=scorer,
                         prompts=prompts,
                         prompt_ids=prompt_ids,
                         prompt_embeds=prompt_embeds,
@@ -663,14 +684,17 @@ def main(_):
                         height=config.resolution,
                         width=config.resolution, 
                         accelerator=accelerator,
-                        timestep_to_prune=6,
-                        num_to_delete_per_prompt=config.sample.num_image_per_prompt_before_pruning - config.sample.num_image_per_prompt, 
                         unique_prompts_num=config.sample.unique_prompts,
                         epoch=epoch,
                         noise_level=config.sample.noise_level,
                         generator=generator,
-                        operate_diffsim_latent_index=[6]
+                        skip_timesteps=config.sample.skip_timesteps,
+                        lefts=config.sample.lefts,
+                        skip_scheduler_list=skip_scheduler_list,
                 )
+                    
+            if epoch == 0:
+                break
 
             # 重新编码prompt_ids和prompt_embeds和pooled_prompt_embeds
             prompt_ids = tokenizers[0](
@@ -702,6 +726,7 @@ def main(_):
             # import sys; sys.exit()
             timesteps = pipeline.scheduler.timesteps.repeat(
                 int(config.sample.num_image_per_prompt * config.sample.unique_prompts // accelerator.num_processes), 1
+                # config.sample.train_batch_size, 1
             )  # (batch_size, num_steps)
             # print(f"timesteps.shape:{timesteps.shape}")
 
@@ -726,6 +751,10 @@ def main(_):
                     "rewards": rewards,
                 }
             )
+
+        if epoch == 0:
+            epoch += 1
+            continue
 
         # wait for all rewards to be computed
         for sample in tqdm(
