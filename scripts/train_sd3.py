@@ -366,12 +366,12 @@ def main(_):
     )
     if accelerator.is_main_process:
         wandb.init(
-            project="flow_grpo_hcy",
+            project="flow_grpo_branch",
         )
         accelerator.init_trackers(
             project_name="flow-grpo",
             config=config.to_dict(),
-            init_kwargs={"wandb": {"name": config.run_name}},
+            init_kwargs={"wandb": {"name": config.save_dir}},
         )
     logger.info(f"\n{config}")
 
