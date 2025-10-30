@@ -262,18 +262,21 @@ def skip_pruning(self, accelerator, temp_skip_schedular, scorer, prompt, noise_p
     valid_indices = []
     for i in range(num_processes):
         block_start = i * (skip_image_world.shape[0] // num_processes)
-        if i < remainder:
-            # Full block is valid
-            valid_indices.extend(range(block_start, block_start + (skip_image_world.shape[0] // num_processes)))
+        if remainder != 0:
+            if i < remainder:
+                # Full block is valid
+                valid_indices.extend(range(block_start, block_start + (skip_image_world.shape[0] // num_processes)))
+            else:
+                # Exclude the last padded element
+                valid_indices.extend(range(block_start, block_start + (skip_image_world.shape[0] // num_processes) - 1))
         else:
-            # Exclude the last padded element
-            valid_indices.extend(range(block_start, block_start + (skip_image_world.shape[0] // num_processes) - 1))
+            valid_indices.extend(range(block_start, block_start + (skip_image_world.shape[0] // num_processes)))
 
     valid_indices_tensor = torch.tensor(valid_indices, device=accelerator.device)
     skip_image_world = skip_image_world.index_select(0, index=valid_indices_tensor)
     skip_image = self.image_processor.postprocess(skip_image_world, output_type='pil') 
     
-    prompt_list = [prompt] * len(skip_image)
+    prompt_list = [prompt] * p_num_img
     skip_rewards = scorer(prompt_list, skip_image)
     skip_rewards = skip_rewards.cpu().numpy()
 
