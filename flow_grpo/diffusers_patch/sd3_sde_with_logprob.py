@@ -8,6 +8,13 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
+def index_for_timestep(self, t):
+    tolerance = 1e-4  # 你可以根据需要调整这个容忍度
+    indices = (torch.abs(self.timesteps - t) < tolerance).nonzero()
+
+    pos = 1 if len(indices) > 1 else 0
+    return indices[pos].item()
+
 def sde_step_with_logprob(
     self: FlowMatchEulerDiscreteScheduler,
     model_output: torch.FloatTensor,
@@ -38,7 +45,8 @@ def sde_step_with_logprob(
     if prev_sample is not None:
         prev_sample=prev_sample.float()
 
-    step_index = [self.index_for_timestep(t) for t in timestep]
+    # step_index = [self.index_for_timestep(t) for t in timestep]
+    step_index = [index_for_timestep(self, t) for t in timestep]
     prev_step_index = [step+1 for step in step_index]
     sigma = self.sigmas[step_index].view(-1, *([1] * (len(sample.shape) - 1)))
     sigma_prev = self.sigmas[prev_step_index].view(-1, *([1] * (len(sample.shape) - 1)))
