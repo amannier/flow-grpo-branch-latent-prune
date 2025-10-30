@@ -228,28 +228,56 @@ def mean_attn_max_var_pruning(attn_maps, k):
     return max_var_mean
 
 @torch.no_grad()
-def skip_pruning(self, temp_skip_schedular, scorer, prompt, noise_pred, latents, k, t):
+def skip_pruning(self, accelerator, temp_skip_schedular, scorer, prompt, noise_pred, latents, k, t):
     assert scorer is not None, "scorer 需要被定义来计算skip images的奖励"
     # print(temp_skip_schedular.timesteps, t)
-    skip_latents, _, _, _ = sde_step_with_logprob(
+    # 分配
+    num_processes = accelerator.num_processes
+    rank = accelerator.process_index
+    p_num_img = noise_pred.shape[0]
+    remainder = p_num_img % num_processes
+
+    base_num_per_process = p_num_img // num_processes
+    block_size = base_num_per_process + (1 if rank < remainder else 0)
+    start_idx = sum(base_num_per_process + (1 if i < remainder else 0) for i in range(rank))
+    r_noise_pred = noise_pred[start_idx: start_idx + block_size]
+    r_latents = latents[start_idx: start_idx + block_size]
+
+    r_skip_latents, _, _, _ = sde_step_with_logprob(
         temp_skip_schedular, 
-        noise_pred.float(), 
+        r_noise_pred.float(), 
         t.unsqueeze(0), 
-        latents.float(),
+        r_latents.float(),
         noise_level=0,
     )
 
-    skip_latents = (skip_latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
-    skip_latents = skip_latents.to(dtype=self.vae.dtype)
-    skip_image = self.vae.decode(skip_latents, return_dict=False)[0]
-    skip_image = self.image_processor.postprocess(skip_image, output_type='pil') # =output_type  
+    r_skip_latents = (r_skip_latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+    r_skip_latents = r_skip_latents.to(dtype=self.vae.dtype)
+    r_skip_image = self.vae.decode(r_skip_latents, return_dict=False)[0]
+    r_skip_image = self.image_processor.postprocess(r_skip_image, output_type='latent') 
+
+    r_skip_image = accelerator.pad_across_processes([r_skip_image], dim=0)[0]
+    skip_image_world = accelerator.gather(r_skip_image).to(accelerator.device)
+
+    valid_indices = []
+    for i in range(num_processes):
+        block_start = i * (skip_image_world.shape[0] // num_processes)
+        if i < remainder:
+            # Full block is valid
+            valid_indices.extend(range(block_start, block_start + (skip_image_world.shape[0] // num_processes)))
+        else:
+            # Exclude the last padded element
+            valid_indices.extend(range(block_start, block_start + (skip_image_world.shape[0] // num_processes) - 1))
+
+    valid_indices_tensor = torch.tensor(valid_indices, device=accelerator.device)
+    skip_image_world = skip_image_world.index_select(0, index=valid_indices_tensor)
+    skip_image = self.image_processor.postprocess(skip_image_world, output_type='pil') 
     
     prompt_list = [prompt] * len(skip_image)
     skip_rewards = scorer(prompt_list, skip_image)
     skip_rewards = skip_rewards.cpu().numpy()
 
-    # debug_folder = '/data11/xinyue.liu/sjy/flow_grpo_hcy/flow_grpo/debug_remainder'
-    # print(prompt)
+    # debug_folder = '/data11/xinyue.liu/sjy/flow_grpo_hcy/flow_grpo/debug_pass_skip_image'
     # for score, img in zip(skip_rewards, skip_image):
     #     import os
     #     img_save_path = os.path.join(debug_folder, f'{t}_{score}.png')
@@ -562,7 +590,7 @@ def pipeline_with_logprob_hcy(
                     p_latents_before = latents_before_world.index_select(0, torch.tensor(positions, device=accelerator.device))
                     p_noise_pred = noise_pred_world.index_select(0, torch.tensor(positions, device=accelerator.device))
                     # 筛选函数, 返回index_list
-                    p_left_index = skip_pruning(self, skip_scheduler_list[skip_t_index], scorer, prompt, p_noise_pred, p_latents_before, left_per_prompt, t)
+                    p_left_index = skip_pruning(self, accelerator, skip_scheduler_list[skip_t_index], scorer, prompt, p_noise_pred, p_latents_before, left_per_prompt, t)
 
                     selected_index_world = torch.tensor([positions[index] for index in p_left_index], device=accelerator.device)
 
@@ -644,7 +672,7 @@ def pipeline_with_logprob_hcy(
     self.maybe_free_model_hooks()
 
     # if latent_extract_index is not None:
-    #     return image, latent_extract, all_latents, all_log_probs, prompts
+    #     return image, latent_extract, all_latents, all_log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds
     # if operate_diffsim_latent_index is not None:
-    #     return image, attn_dict, all_latents, all_log_probs, prompts
-    return image, all_latents, all_log_probs, prompts
+    #     return image, attn_dict, all_latents, all_log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds
+    return image, all_latents, all_log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds

@@ -626,11 +626,11 @@ def main(_):
 
     while True:
         #################### EVAL ####################
-        # pipeline.transformer.eval()
-        # if epoch % config.eval_freq == 0:
-        #     eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
-        # if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
-        #     save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
+        pipeline.transformer.eval()
+        if epoch % config.eval_freq == 0:
+            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
+        if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
+            save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 
         #################### SAMPLING ####################
         pipeline.transformer.eval()
@@ -667,7 +667,7 @@ def main(_):
                 generator = None
             with autocast():
                 with torch.no_grad():
-                    images, latents, log_probs, prompts = pipeline_with_logprob_hcy(
+                    images, latents, log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds = pipeline_with_logprob_hcy(
                         pipeline,
                         scorer=scorer,
                         prompts=prompts,
@@ -696,24 +696,28 @@ def main(_):
             if epoch == 0:
                 break
 
-            # 重新编码prompt_ids和prompt_embeds和pooled_prompt_embeds
-            prompt_ids = tokenizers[0](
-                prompts,
-                padding="max_length",
-                max_length=256,
-                truncation=True,
-                return_tensors="pt",
-            ).input_ids.to(accelerator.device)
-            # print("prompt_ids.shape", prompt_ids.shape)
+            if pipeline.do_classifier_free_guidance:
+                _, prompt_embeds = torch.chunk(prompt_embeds, 2, dim=0)
+                _, pooled_prompt_embeds = torch.chunk(pooled_prompt_embeds, 2, dim=0)
 
-            prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
-                prompts,
-                text_encoders,
-                tokenizers,
-                max_sequence_length=128,
-                device=accelerator.device
-            )
-            # print("prompt_embeds.shape", prompt_embeds.shape)
+            # # 重新编码prompt_ids和prompt_embeds和pooled_prompt_embeds
+            # prompt_ids = tokenizers[0](
+            #     prompts,
+            #     padding="max_length",
+            #     max_length=256,
+            #     truncation=True,
+            #     return_tensors="pt",
+            # ).input_ids.to(accelerator.device)
+            # # print("prompt_ids.shape", prompt_ids.shape)
+
+            # prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
+            #     prompts,
+            #     text_encoders,
+            #     tokenizers,
+            #     max_sequence_length=128,
+            #     device=accelerator.device
+            # )
+            # # print("prompt_embeds.shape", prompt_embeds.shape)
 
             latents = torch.stack(
                 latents, dim=1
