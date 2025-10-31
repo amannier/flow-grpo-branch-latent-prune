@@ -362,6 +362,7 @@ def main(_):
     if accelerator.is_main_process:
         wandb.init(
             project="flow_grpo_branch",
+            name=config.save_dir,
         )
         # accelerator.init_trackers(
         #     project_name="flow-grpo",
