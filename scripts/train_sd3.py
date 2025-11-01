@@ -36,7 +36,7 @@ from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import r
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
-TRAIN_START_TIME = None
+TRAIN_START_TIME = 0
 EVAL_TIME_ACCUMULATED = 0  # 累计的 eval 时间（秒）
 
 def calculate_gpu_hours(accelerator):
@@ -654,8 +654,9 @@ def main(_):
         if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
             save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 
-        gpu_hours = calculate_gpu_hours(accelerator)
-        wandb.log({"gpu_hours": gpu_hours}, step=global_step)
+        if accelerator.is_main_process:
+            gpu_hours = calculate_gpu_hours(accelerator)
+            wandb.log({"gpu_hours": gpu_hours}, step=global_step)
         #################### SAMPLING ####################
         pipeline.transformer.eval()
         samples = []
