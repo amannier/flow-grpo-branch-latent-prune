@@ -228,7 +228,7 @@ def mean_attn_max_var_pruning(attn_maps, k):
     return max_var_mean
 
 @torch.no_grad()
-def skip_pruning(self, accelerator, temp_skip_schedular, scorer, prompt, noise_pred, latents, k, t):
+def skip_pruning(self, accelerator, temp_skip_schedular, scorer, prompt, noise_pred, latents, k, t, height, width):
     assert scorer is not None, "scorer 需要被定义来计算skip images的奖励"
     # print(temp_skip_schedular.timesteps, t)
     # 分配
@@ -243,18 +243,22 @@ def skip_pruning(self, accelerator, temp_skip_schedular, scorer, prompt, noise_p
     r_noise_pred = noise_pred[start_idx: start_idx + block_size]
     r_latents = latents[start_idx: start_idx + block_size]
 
-    r_skip_latents, _, _, _ = sde_step_with_logprob(
-        temp_skip_schedular, 
-        r_noise_pred.float(), 
-        t.unsqueeze(0), 
-        r_latents.float(),
-        noise_level=0,
-    )
+    if block_size > 0:
+        r_skip_latents, _, _, _ = sde_step_with_logprob(
+            temp_skip_schedular, 
+            r_noise_pred.float(), 
+            t.unsqueeze(0), 
+            r_latents.float(),
+            noise_level=0,
+        )
 
-    r_skip_latents = (r_skip_latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
-    r_skip_latents = r_skip_latents.to(dtype=self.vae.dtype)
-    r_skip_image = self.vae.decode(r_skip_latents, return_dict=False)[0]
-    r_skip_image = self.image_processor.postprocess(r_skip_image, output_type='latent') 
+        r_skip_latents = (r_skip_latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+        r_skip_latents = r_skip_latents.to(dtype=self.vae.dtype)
+        r_skip_image = self.vae.decode(r_skip_latents, return_dict=False)[0]
+        r_skip_image = self.image_processor.postprocess(r_skip_image, output_type='latent') # [batch_size, 3, 512, 512]
+    else:
+        # Create an empty tensor with the expected shape [0, 3, H, W], inferring spatial dimensions from latents
+        r_skip_image = torch.empty((0, 3, height, width), dtype=self.vae.dtype, device=accelerator.device)
 
     r_skip_image = accelerator.pad_across_processes([r_skip_image], dim=0)[0]
     skip_image_world = accelerator.gather(r_skip_image).to(accelerator.device)
@@ -337,7 +341,7 @@ def pipeline_with_logprob_hcy(
         "skip_timesteps 与 lefts 与 skip_scheduler_list 必须同时提供或同时省略"
 
     if skip_timesteps is not None:  
-        assert len(skip_timesteps) == len(lefts), \
+        assert len(skip_timesteps) == len(lefts) == len(skip_scheduler_list), \
             "skip_timesteps 与 lefts 与 skip_scheduler_list 的长度必须一致"
 
     height = height or self.default_sample_size * self.vae_scale_factor
@@ -593,7 +597,7 @@ def pipeline_with_logprob_hcy(
                     p_latents_before = latents_before_world.index_select(0, torch.tensor(positions, device=accelerator.device))
                     p_noise_pred = noise_pred_world.index_select(0, torch.tensor(positions, device=accelerator.device))
                     # 筛选函数, 返回index_list
-                    p_left_index = skip_pruning(self, accelerator, skip_scheduler_list[skip_t_index], scorer, prompt, p_noise_pred, p_latents_before, left_per_prompt, t)
+                    p_left_index = skip_pruning(self, accelerator, skip_scheduler_list[skip_t_index], scorer, prompt, p_noise_pred, p_latents_before, left_per_prompt, t, height, width)
 
                     selected_index_world = torch.tensor([positions[index] for index in p_left_index], device=accelerator.device)
 
