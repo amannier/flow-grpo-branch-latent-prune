@@ -290,7 +290,8 @@ def pickscore_sd3_pruning_new_48_to_24():
     # 新增：生成时间戳
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # 更新：将时间戳附加到 save_dir
-    config.save_dir = f'logs/pickscore/sd3.5-M-pruning-48-to-24_{timestamp}'
+    config.run_name = f'pruning-48-to-24_{timestamp}'
+    config.save_dir = f'logs/pickscore/{config.run_name}'
     # config.save_dir = 'logs/pickscore/sd3.5-M'
     config.reward_fn = {
         "pickscore": 1.0,
@@ -395,7 +396,113 @@ def pickscore_sd3_new_origin_24():
     return config
 
 
-def pickscore_sd3_new_origin_24_new_align():
+
+def pickscore_sd3_pruning_48_to_12_bs_4():
+    gpu_number = 24
+    config = compressibility()
+    config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
+
+    # sd3.5 medium
+    config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
+    config.pretrained.reward_model = 'pickscore'
+    config.sample.num_steps = 10
+    config.sample.eval_num_steps = 40
+    config.sample.guidance_scale = 4.5
+
+    config.resolution = 512
+    config.sample.train_batch_size = 4
+    config.sample.num_image_per_prompt_before_pruning = 48
+    config.sample.skip_timesteps = [5,7]
+    config.sample.lefts = [24,12]
+    config.sample.num_image_per_prompt = config.sample.lefts[-1]
+    # 所有进程一次batch总共算了多少不同的prompt
+    config.sample.unique_prompts = int(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt_before_pruning)
+    # 加一个sample_batches_per_epoch，用于记录每次采样多少个batch，因为每次采样多少个batch是根据num_image_per_prompt_before_pruning计算的，所以需要一个变量来记录
+    config.sample.sample_batches_per_epoch = int(96/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt_before_pruning))
+    config.sample.num_batches_per_epoch = int(96/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
+    config.sample.test_batch_size = 16 # This bs is a special design, the test set has a total of 2048, to make gpu_num*bs*n as close as possible to 2048, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
+
+    config.train.batch_size = config.sample.train_batch_size
+    config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch//2
+    config.train.num_inner_epochs = 1
+    config.train.timestep_fraction = 0.99
+    config.train.beta = 0.01
+    config.sample.global_std = True
+    config.sample.same_latent = False
+    config.train.ema = True
+    config.save_freq = 60 # epoch
+    config.eval_freq = 60
+    # 新增：生成时间戳
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    config.run_name = f'pruning-48-to-12-bs-4'
+    # 更新：将时间戳附加到 save_dir
+    config.save_dir = f'logs/pickscore/sd3.5-M-pruning-48-to-12-bs-4_{timestamp}'
+    # config.save_dir = 'logs/pickscore/sd3.5-M'
+    config.reward_fn = {
+        "pickscore": 1.0,
+    }
+    
+    config.prompt_fn = "general_ocr"
+
+    config.per_prompt_stat_tracking = True
+    return config
+
+
+def pickscore_sd3_pruning_24_to_12_bs_4():
+    gpu_number = 24
+    config = compressibility()
+    config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
+
+    # sd3.5 medium
+    config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
+    config.pretrained.reward_model = 'pickscore'
+    config.sample.num_steps = 10
+    config.sample.eval_num_steps = 40
+    config.sample.guidance_scale = 4.5
+
+    config.resolution = 512
+    config.sample.train_batch_size = 4
+    config.sample.num_image_per_prompt_before_pruning = 24
+    config.sample.skip_timesteps = [5,7]
+    config.sample.lefts = [16,12]
+    config.sample.num_image_per_prompt = config.sample.lefts[-1]
+    # 所有进程一次batch总共算了多少不同的prompt
+    config.sample.unique_prompts = int(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt_before_pruning)
+    # 加一个sample_batches_per_epoch，用于记录每次采样多少个batch，因为每次采样多少个batch是根据num_image_per_prompt_before_pruning计算的，所以需要一个变量来记录
+    config.sample.sample_batches_per_epoch = int(96/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt_before_pruning))
+    config.sample.num_batches_per_epoch = int(96/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
+    config.sample.test_batch_size = 16 # This bs is a special design, the test set has a total of 2048, to make gpu_num*bs*n as close as possible to 2048, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
+
+    config.train.batch_size = config.sample.train_batch_size
+    config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch//2
+    config.train.num_inner_epochs = 1
+    config.train.timestep_fraction = 0.99
+    config.train.beta = 0.01
+    config.sample.global_std = True
+    config.sample.same_latent = False
+    config.train.ema = True
+    config.save_freq = 60 # epoch
+    config.eval_freq = 60
+    # 新增：生成时间戳
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    config.run_name = f'pruning-24-to-12-bs-4'
+    # 更新：将时间戳附加到 save_dir
+    config.save_dir = f'logs/pickscore/sd3.5-M-pruning-24-to-12-bs-4_{timestamp}'
+    # config.save_dir = 'logs/pickscore/sd3.5-M'
+    config.reward_fn = {
+        "pickscore": 1.0,
+    }
+    
+    config.prompt_fn = "general_ocr"
+
+    config.per_prompt_stat_tracking = True
+    return config
+
+
+
+def pickscore_sd3_new_origin_24_new_align_bs_4():
     gpu_number=24
     config = compressibility()
     config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
@@ -407,7 +514,7 @@ def pickscore_sd3_new_origin_24_new_align():
     config.sample.guidance_scale = 4.5
 
     config.resolution = 512
-    config.sample.train_batch_size = 12
+    config.sample.train_batch_size = 4
     config.sample.num_image_per_prompt = 24
     config.sample.num_batches_per_epoch = int(48/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
@@ -426,7 +533,8 @@ def pickscore_sd3_new_origin_24_new_align():
     # 新增：生成时间戳
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # 更新：将时间戳附加到 save_dir
-    config.save_dir = f'logs/pickscore/sd3.5-M-origin-24_new_align_{timestamp}'
+    config.run_name = f'origin-24-new-align-bs-4'
+    config.save_dir = f'logs/pickscore/sd3.5-M-origin-24_new_align_bs_4_{timestamp}'
     # config.save_dir = 'logs/pickscore/sd3.5-M'
     config.reward_fn = {
         "pickscore": 1.0,
@@ -478,7 +586,8 @@ def pickscore_sd3_pruning_2gpu():
     # 新增：生成时间戳
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # 更新：将时间戳附加到 save_dir
-    config.save_dir = f'logs/pickscore/sd3.5-M-pruning-8-to-4_{timestamp}'
+    config.run_name = f'pruning-8-to-4'
+    config.save_dir = f'logs/pickscore/{config.run_name}_{timestamp}'
     # config.save_dir = 'logs/pickscore/sd3.5-M'
     config.reward_fn = {
         "pickscore": 1.0,

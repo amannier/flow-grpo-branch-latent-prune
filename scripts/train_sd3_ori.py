@@ -33,6 +33,17 @@ from flow_grpo.ema import EMAModuleWrapper
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
+TRAIN_START_TIME = None
+EVAL_TIME_ACCUMULATED = 0  # 累计的 eval 时间（秒）
+
+def calculate_gpu_hours(accelerator):
+    elapsed_seconds = time.time() - TRAIN_START_TIME - EVAL_TIME_ACCUMULATED
+    elapsed_hours = elapsed_seconds / 3600.0
+    total_gpus = accelerator.num_processes
+    gpu_hours = elapsed_hours * total_gpus
+    return gpu_hours
+
+
 
 FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", "config/base.py", "Training configuration.")
@@ -215,6 +226,9 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
 def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
+    global EVAL_TIME_ACCUMULATED
+    eval_start_time = time.time()  # 记录 eval 开始时间
+    
     if config.train.ema:
         ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
@@ -314,6 +328,11 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
             )
     if config.train.ema:
         ema.copy_temp_to(transformer_trainable_parameters)
+    
+    # 计算 eval 耗时并累加到 EVAL_TIME_ACCUMULATED（每个进程都累加自己的时间）
+    eval_end_time = time.time()
+    eval_duration = eval_end_time - eval_start_time
+    EVAL_TIME_ACCUMULATED += eval_duration
 
 def unwrap_model(model, accelerator):
     model = accelerator.unwrap_model(model)
@@ -362,7 +381,11 @@ def main(_):
     if accelerator.is_main_process:
         wandb.init(
             project="flow_grpo_branch",
-            name=config.save_dir,
+            name=config.run_name
+        )
+        accelerator.init_trackers(
+            project_name="flow-grpo",
+            config=config.to_dict()
         )
         # accelerator.init_trackers(
         #     project_name="flow-grpo",
@@ -598,6 +621,11 @@ def main(_):
     global_step = 0
     train_iter = iter(train_dataloader)
 
+    global TRAIN_START_TIME
+    if accelerator.is_main_process:
+        TRAIN_START_TIME = time.time()
+
+
     while True:
         #################### EVAL ####################
         pipeline.transformer.eval()
@@ -606,6 +634,8 @@ def main(_):
         if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
             save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 
+        gpu_hours = calculate_gpu_hours(accelerator)
+        wandb.log({"gpu_hours": gpu_hours}, step=global_step)
         #################### SAMPLING ####################
         pipeline.transformer.eval()
         samples = []

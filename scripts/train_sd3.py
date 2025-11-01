@@ -36,6 +36,15 @@ from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import r
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
+TRAIN_START_TIME = None
+EVAL_TIME_ACCUMULATED = 0  # 累计的 eval 时间（秒）
+
+def calculate_gpu_hours(accelerator):
+    elapsed_seconds = time.time() - TRAIN_START_TIME - EVAL_TIME_ACCUMULATED
+    elapsed_hours = elapsed_seconds / 3600.0
+    total_gpus = accelerator.num_processes
+    gpu_hours = elapsed_hours * total_gpus
+    return gpu_hours
 
 FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", "config/base.py", "Training configuration.")
@@ -218,6 +227,9 @@ def compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, co
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
 def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
+    global EVAL_TIME_ACCUMULATED
+    eval_start_time = time.time()  # 记录 eval 开始时间
+    
     if config.train.ema:
         ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
@@ -303,6 +315,7 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
             sampled_rewards = [{k: last_batch_rewards_gather[k][index] for k in last_batch_rewards_gather} for index in sample_indices]
             for key, value in all_rewards.items():
                 print(key, value.shape)
+
             # 连不上wandb
             wandb.log(
                 {
@@ -319,6 +332,11 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
             )
     if config.train.ema:
         ema.copy_temp_to(transformer_trainable_parameters)
+    
+    # 计算 eval 耗时并累加到 EVAL_TIME_ACCUMULATED（每个进程都累加自己的时间）
+    eval_end_time = time.time()
+    eval_duration = eval_end_time - eval_start_time
+    EVAL_TIME_ACCUMULATED += eval_duration
 
 def unwrap_model(model, accelerator):
     model = accelerator.unwrap_model(model)
@@ -367,11 +385,11 @@ def main(_):
     if accelerator.is_main_process:
         wandb.init(
             project="flow_grpo_branch",
+            name=config.run_name
         )
         accelerator.init_trackers(
             project_name="flow-grpo",
-            config=config.to_dict(),
-            init_kwargs={"wandb": {"name": config.save_dir}},
+            config=config.to_dict()
         )
     logger.info(f"\n{config}")
 
@@ -571,7 +589,7 @@ def main(_):
     samples_per_epoch = (
         config.sample.train_batch_size
         * accelerator.num_processes
-        * config.sample.num_batches_per_epoch
+        * config.sample.num_batches_per_epoch # 这里是否要改为sample_batches_per_epoch？不是，因为下面的 Number of gradient updates per inner epoch 根据config要为2
     )
     total_train_batch_size = (
         config.train.batch_size
@@ -593,7 +611,7 @@ def main(_):
     logger.info(
         f"  Number of gradient updates per inner epoch = {samples_per_epoch // total_train_batch_size}"
     )
-    logger.info(f"  Number of inner epochs = {config.train.num_inner_epochs}")
+    logger.info(f"  Number of inner epochs = {config.train.num_inner_epochs}") # default 1
     # assert config.sample.train_batch_size >= config.train.batch_size
     # assert config.sample.train_batch_size % config.train.batch_size == 0
     # assert samples_per_epoch % total_train_batch_size == 0
@@ -624,6 +642,10 @@ def main(_):
         )
         skip_scheduler_list.append(temp_skip_schedular)
 
+    global TRAIN_START_TIME
+    if accelerator.is_main_process:
+        TRAIN_START_TIME = time.time()
+
     while True:
         #################### EVAL ####################
         pipeline.transformer.eval()
@@ -632,6 +654,8 @@ def main(_):
         if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
             save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 
+        gpu_hours = calculate_gpu_hours(accelerator)
+        wandb.log({"gpu_hours": gpu_hours}, step=global_step)
         #################### SAMPLING ####################
         pipeline.transformer.eval()
         samples = []
@@ -692,9 +716,6 @@ def main(_):
                         lefts=config.sample.lefts,
                         skip_scheduler_list=skip_scheduler_list,
                 )
-                    
-            if epoch == 0:
-                break
 
             if pipeline.do_classifier_free_guidance:
                 _, prompt_embeds = torch.chunk(prompt_embeds, 2, dim=0)
