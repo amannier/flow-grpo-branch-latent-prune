@@ -620,10 +620,11 @@ def main(_):
     global_step = 0
     train_iter = iter(train_dataloader)
 
-    # 定义scorer
-    if config.pretrained.reward_model == 'pickscore':
-        from flow_grpo.pickscore_scorer import PickScoreScorer
-        scorer = PickScoreScorer(device=accelerator.device, dtype=torch.float32)
+    # # 定义scorer
+    # if config.pretrained.reward_model == 'pickscore':
+    #     from flow_grpo.pickscore_scorer import PickScoreScorer
+    #     scorer = PickScoreScorer(device=accelerator.device, dtype=torch.float32)
+    reward_name = list(config.reward_fn.keys())[0]
 
     # 定义skip_scheduler
     scheduler_kwargs = {}
@@ -668,7 +669,7 @@ def main(_):
             position=0,
         ):
             train_sampler.set_epoch(epoch * config.sample.sample_batches_per_epoch + i)
-            prompts, prompt_metadata = next(train_iter) # len(prompts) = config.sample.train_batch_size = 8, unique_prompts_num = 2
+            prompts, prompt_metadata = next(train_iter) # len(prompts) = config.sample.train_batch_size = 8, unique_prompts_num = 2 prompt_metadata: 字典列表
 
             prompt_embeds, pooled_prompt_embeds = compute_text_embeddings( # torch.Size([config.sample.train_batch_size, 205, 4096])
                 prompts, 
@@ -692,10 +693,14 @@ def main(_):
                 generator = None
             with autocast():
                 with torch.no_grad():
-                    images, latents, log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds = pipeline_with_logprob_hcy(
+                    images, latents, log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds, prompt_metadata = pipeline_with_logprob_hcy(
                         pipeline,
-                        scorer=scorer,
+                        # scorer=scorer,
+                        reward_fn=reward_fn,
+                        reward_name=reward_name,
+                        executor=executor,
                         prompts=prompts,
+                        prompt_metadata=prompt_metadata,
                         prompt_ids=prompt_ids,
                         prompt_embeds=prompt_embeds,
                         pooled_prompt_embeds=pooled_prompt_embeds,
