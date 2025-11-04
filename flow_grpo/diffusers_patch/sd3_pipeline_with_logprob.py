@@ -758,8 +758,6 @@ def pipeline_with_logprob_hcy(
     # Offload all models
     self.maybe_free_model_hooks()
 
-    import sys; sys.exit()
-
     # if latent_extract_index is not None:
     #     return image, latent_extract, all_latents, all_log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds
     # if operate_diffsim_latent_index is not None:
