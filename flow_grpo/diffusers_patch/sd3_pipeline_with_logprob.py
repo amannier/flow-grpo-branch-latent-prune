@@ -15,7 +15,7 @@ import warnings
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from concurrent.futures import ThreadPoolExecutor
 import time
-import json
+import os, json
 
 def make_debug_qkv_hook(layer_name, storage):  # 传 storage 避 global
     def debug_hook(module, input, output):
@@ -304,6 +304,32 @@ def skip_pruning(self, accelerator, temp_skip_schedular, reward_fn, reward_name,
     skip_max_var_indices, _ = heuristic_max_var_indices(skip_rewards, k)
     return skip_max_var_indices
 
+def skip_predict_rewards(self, accelerator, temp_skip_scheduler, reward_fn, reward_name, executor, prompts, prompt_metadata, noise_pred, latents, t):
+    skip_latents, _, _, _ = sde_step_with_logprob(
+        temp_skip_scheduler,
+        noise_pred.float(),
+        t.unsqueeze(0),
+        latents.float(),
+        noise_level=0,
+    )
+
+    skip_latents = (skip_latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+    skip_latents = skip_latents.to(dtype=self.vae.dtype)
+    skip_images = self.vae.decode(skip_latents, return_dict=False)[0]
+
+    skip_images = self.image_processor.postprocess(skip_images, output_type='latent')
+
+    skip_rewards = executor.submit(reward_fn, skip_images, prompts, prompt_metadata, only_strict=True)
+    time.sleep(0)
+    skip_rewards, _ = skip_rewards.result()
+    skip_rewards = skip_rewards[reward_name]
+    if isinstance(skip_rewards, list):
+        skip_rewards = torch.tensor(skip_rewards, device=accelerator.device)
+    if isinstance(skip_rewards, np.ndarray):
+        skip_rewards = torch.from_numpy(skip_rewards, device=accelerator.device)
+
+    return skip_rewards
+
 # 处理json键值本身含有空格的情况
 def clean_dict(d):
     if isinstance(d, dict):
@@ -530,9 +556,13 @@ def pipeline_with_logprob_hcy(
 
             # if accelerator is not None and i == timestep_to_prune: # 后续调整
             prune_start_time = time.time()
-            skip_prune_time = 0.0
             if accelerator is not None and i in skip_timesteps:
                 skip_t_index = skip_timesteps.index(i)
+                temp_skip_scheduler = skip_scheduler_list[skip_t_index]
+
+                # 在gather前先在每个进程计算skip_rewards
+                skip_rewards = skip_predict_rewards(self, accelerator, temp_skip_scheduler, reward_fn, reward_name, executor, prompts, prompt_metadata, noise_pred, latents_before, t)
+
                 # CFG只在上面的prompt_embeds添加了，所以后续重新编码prompt_embeds时候确实要手动添加neg_prompt_embed
                 neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
 
@@ -574,22 +604,20 @@ def pipeline_with_logprob_hcy(
                     log_prob = accelerator.pad_across_processes([log_prob], dim=0)[0]
                     all_latents_tensor = accelerator.pad_across_processes([all_latents_tensor], dim=0)[0]
                     all_log_probs_tensor = accelerator.pad_across_processes([all_log_probs_tensor], dim=0)[0]
-                    latents_before = accelerator.pad_across_processes([latents_before], dim=0)[0]
-                    noise_pred = accelerator.pad_across_processes([noise_pred], dim=0)[0]
                     prompt_ids = accelerator.pad_across_processes([prompt_ids], dim=0)[0]
                     metadata_ids = accelerator.pad_across_processes([metadata_ids], dim=0)[0]
+                    skip_rewards = accelerator.pad_across_processes([skip_rewards], dim=0)[0]
 
                 latents_world = accelerator.gather(latents).to(accelerator.device) # 我认为是[num_processes * latents.shape[0], 16, 64, 64]
                 log_probs_world = accelerator.gather(log_prob).to(accelerator.device) # [num_processes * latents.shape[0]]   
                 all_latents_tensor_world = accelerator.gather(all_latents_tensor).to(accelerator.device) # [num_process * latents.shape[0], len(all_latents), 16, 64, 64]         
                 all_log_probs_tensor_world = accelerator.gather(all_log_probs_tensor).to(accelerator.device) # [num_process * latents.shape[0], len(all_log_probs)]
 
-                latents_before_world = accelerator.gather(latents_before).to(accelerator.device)
-                noise_pred_world = accelerator.gather(noise_pred).to(accelerator.device)
-
                 # accelerator gather不了prompts，所以gather prompt_ids然后解码
                 prompt_ids_world = accelerator.gather(prompt_ids).to(accelerator.device)
                 metadata_ids_world = accelerator.gather(metadata_ids).to(accelerator.device)
+
+                skip_rewards_world = accelerator.gather(skip_rewards).to(accelerator.device)
 
                 if num_paded !=0:
                     assert latents_world.shape[0] % num_processes == 0, '总gather数不能整除num_process，难道是pad没作用？'
@@ -611,10 +639,9 @@ def pipeline_with_logprob_hcy(
                     log_probs_world = log_probs_world.index_select(dim=0, index=valid_indices_tensor)
                     all_latents_tensor_world = all_latents_tensor_world.index_select(dim=0, index=valid_indices_tensor)
                     all_log_probs_tensor_world = all_log_probs_tensor_world.index_select(dim=0, index=valid_indices_tensor)
-                    latents_before_world = latents_before_world.index_select(dim=0, index=valid_indices_tensor)
-                    noise_pred_world = noise_pred_world.index_select(dim=0, index=valid_indices_tensor)
                     prompt_ids_world = prompt_ids_world.index_select(dim=0, index=valid_indices_tensor)
                     metadata_ids_world = metadata_ids_world.index_select(dim=0, index=valid_indices_tensor)
+                    skip_rewards_world = skip_rewards_world.index_select(dim=0, index=valid_indices_tensor)
 
                 prompts_world = self.tokenizer.batch_decode(
                     prompt_ids_world, skip_special_tokens=True
@@ -639,14 +666,11 @@ def pipeline_with_logprob_hcy(
                     left_per_prompt = lefts[skip_t_index]
                     # assert left_per_prompt > 0, f"timestep{i}: images_per_prompt {len(positions)} must be larger than num_to_delete_per_prompt {num_to_delete_per_prompt}"
 
-                    # p_latents = latents_world.index_select(0, torch.tensor(positions, device=accelerator.device))
-                    p_latents_before = latents_before_world.index_select(0, torch.tensor(positions, device=accelerator.device))
-                    p_noise_pred = noise_pred_world.index_select(0, torch.tensor(positions, device=accelerator.device))
+                    p_skip_rewards = skip_rewards_world.index_select(0, torch.tensor(positions, device=accelerator.device))
+                    p_skip_rewards = p_skip_rewards.cpu().numpy()
                     # 筛选函数, 返回index_list
-                    skip_prune_start_time = time.time()
-                    p_left_index = skip_pruning(self, accelerator, skip_scheduler_list[skip_t_index], reward_fn, reward_name, executor, prompt, metadata_world, p_noise_pred, p_latents_before, left_per_prompt, t, height, width)
-                    skip_prune_end_time = time.time()
-                    skip_prune_time += skip_prune_end_time - skip_prune_start_time
+                    # p_left_index = skip_pruning(self, accelerator, skip_scheduler_list[skip_t_index], reward_fn, reward_name, executor, prompt, metadata_world, p_noise_pred, p_latents_before, left_per_prompt, t, height, width)
+                    p_left_index, _ = heuristic_max_var_indices(p_skip_rewards, left_per_prompt)
 
                     selected_index_world = torch.tensor([positions[index] for index in p_left_index], device=accelerator.device)
 
@@ -720,8 +744,7 @@ def pipeline_with_logprob_hcy(
 
                 prune_end_time = time.time()
                 prune_time = prune_end_time - prune_start_time
-                skip_time_rate = skip_prune_time / prune_time
-                print(f'第{i}步的剪枝总时间：{prune_time:.6f}秒，skip_prune时间：{skip_prune_time}， 占比{skip_time_rate:.2f}')
+                print(f'第{i}步的剪枝总时间：{prune_time:.6f}秒')
             
             # call the callback, if provided
             if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -734,6 +757,8 @@ def pipeline_with_logprob_hcy(
 
     # Offload all models
     self.maybe_free_model_hooks()
+
+    import sys; sys.exit()
 
     # if latent_extract_index is not None:
     #     return image, latent_extract, all_latents, all_log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds
