@@ -241,7 +241,7 @@ def geneval_sd3_new_48_to_12():
     config.save_freq = 60 # epoch
     config.eval_freq = 60
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    config.run_name = f'geneval_ori-48_to_12_bs_8'
+    config.run_name = f'geneval_48_to_12_bs_8'
     config.save_dir = f'logs/geneval/{config.run_name}_{timestamp}'
     config.reward_fn = {
         "geneval": 1.0,
@@ -287,7 +287,7 @@ def geneval_sd3_new_24_to_12():
     config.save_freq = 60 # epoch
     config.eval_freq = 60
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    config.run_name = f'geneval_ori-24_to_12_bs_8'
+    config.run_name = f'geneval_24_to_12_bs_8'
     config.save_dir = f'logs/geneval/{config.run_name}_{timestamp}'
     config.reward_fn = {
         "geneval": 1.0,
