@@ -317,8 +317,8 @@ def geneval_sd3_new_48_to_12_bs_4():
     # 所有进程一次batch总共算了多少不同的prompt
     config.sample.unique_prompts = int(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt_before_pruning)
     # 加一个sample_batches_per_epoch，用于记录每次采样多少个batch，因为每次采样多少个batch是根据num_image_per_prompt_before_pruning计算的，所以需要一个变量来记录
-    config.sample.sample_batches_per_epoch = int(48/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt_before_pruning))
-    config.sample.num_batches_per_epoch = int(48/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.sample_batches_per_epoch = int(96/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt_before_pruning))
+    config.sample.num_batches_per_epoch = int(96/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
     config.sample.test_batch_size = 14 # This bs is a special design, the test set has a total of 2212, to make gpu_num*bs*n as close as possible to 2212, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
 
@@ -363,8 +363,8 @@ def geneval_sd3_new_24_to_12_bs_4():
     # 所有进程一次batch总共算了多少不同的prompt
     config.sample.unique_prompts = int(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt_before_pruning)
     # 加一个sample_batches_per_epoch，用于记录每次采样多少个batch，因为每次采样多少个batch是根据num_image_per_prompt_before_pruning计算的，所以需要一个变量来记录
-    config.sample.sample_batches_per_epoch = int(48/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt_before_pruning))
-    config.sample.num_batches_per_epoch = int(48/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
+    config.sample.sample_batches_per_epoch = int(96/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt_before_pruning))
+    config.sample.num_batches_per_epoch = int(96/(gpu_number*config.sample.train_batch_size/config.sample.num_image_per_prompt))
     assert config.sample.num_batches_per_epoch % 2 == 0, "Please set config.sample.num_batches_per_epoch to an even number! This ensures that config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch / 2, so that gradients are updated twice per epoch."
     config.sample.test_batch_size = 14 # This bs is a special design, the test set has a total of 2212, to make gpu_num*bs*n as close as possible to 2212, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
 
