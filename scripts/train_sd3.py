@@ -693,6 +693,8 @@ def main(_):
                 generator = None
             with autocast():
                 with torch.no_grad():
+                    print(f'采样长度{len(prompts)}开始')
+                    sample_start_time = time.time()
                     images, latents, log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds, prompt_metadata = pipeline_with_logprob_hcy(
                         pipeline,
                         # scorer=scorer,
@@ -722,6 +724,9 @@ def main(_):
                         lefts=config.sample.lefts,
                         skip_scheduler_list=skip_scheduler_list,
                 )
+                    sample_end_time = time.time()
+                    if accelerator.is_main_process:
+                        print(f"采样结束，剪枝到{len(prompts)}，耗时{sample_end_time - sample_start_time}")
 
             if pipeline.do_classifier_free_guidance:
                 _, prompt_embeds = torch.chunk(prompt_embeds, 2, dim=0)
@@ -750,11 +755,7 @@ def main(_):
                 latents, dim=1
             )  # (batch_size, num_steps + 1, 16, 96, 96) # 96?
             log_probs = torch.stack(log_probs, dim=1)  # shape after stack (batch_size, num_steps)
-            # print("latents.shape", latents.shape)
-            # import sys; sys.exit()
 
-            # print("timesteps.shape", pipeline.scheduler.timesteps.shape, "config.sample.train_batch_size", config.sample.train_batch_size)
-            # import sys; sys.exit()
             timesteps = pipeline.scheduler.timesteps.repeat(
                 int(config.sample.num_image_per_prompt * config.sample.unique_prompts // accelerator.num_processes), 1
                 # config.sample.train_batch_size, 1
@@ -886,11 +887,6 @@ def main(_):
         else:
             advantages = (gathered_rewards['avg'] - gathered_rewards['avg'].mean()) / (gathered_rewards['avg'].std() + 1e-4)
 
-        # ungather advantages; we only need to keep the entries corresponding to the samples on this process
-        # # debug: 打印sample内容
-        # if torch.distributed.get_rank() == 0:
-        #     print({k: (v.shape if isinstance(v, torch.Tensor) else {sk: sv.shape for sk, sv in v.items()}) for k, v in samples.items()})
-        # import sys; sys.exit()
         advantages = torch.as_tensor(advantages)
         samples["advantages"] = (
             advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
@@ -1066,6 +1062,9 @@ def main(_):
             # make sure we did an optimization step at the end of the inner epoch
             # assert accelerator.sync_gradients
         
+        del samples
+        torch.cuda.empty_cache()
+
         epoch+=1
         
 if __name__ == "__main__":
