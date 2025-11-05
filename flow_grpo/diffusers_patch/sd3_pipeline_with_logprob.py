@@ -744,7 +744,16 @@ def pipeline_with_logprob_hcy(
 
                 prune_end_time = time.time()
                 prune_time = prune_end_time - prune_start_time
-                print(f'第{i}步的剪枝总时间：{prune_time:.6f}秒')
+                # print(f'第{i}步的剪枝总时间：{prune_time:.6f}秒')
+
+                del latents_world
+                del log_probs_world
+                del all_log_probs_tensor_world
+                del all_latents_tensor_world
+                del prompt_ids_world
+                del metadata_ids_world
+                del skip_rewards_world
+                torch.cuda.empty_cache() 
             
             # call the callback, if provided
             if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
