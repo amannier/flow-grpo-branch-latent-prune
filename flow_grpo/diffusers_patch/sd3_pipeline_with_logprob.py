@@ -15,7 +15,7 @@ import warnings
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from concurrent.futures import ThreadPoolExecutor
 import time
-import os, json
+import os, json, bisect
 
 def make_debug_qkv_hook(layer_name, storage):  # 传 storage 避 global
     def debug_hook(module, input, output):
@@ -305,6 +305,7 @@ def skip_pruning(self, accelerator, temp_skip_schedular, reward_fn, reward_name,
     return skip_max_var_indices
 
 def skip_predict_rewards(self, accelerator, temp_skip_scheduler, reward_fn, reward_name, executor, prompts, prompt_metadata, noise_pred, latents, t):
+    predict_x0_start = time.time()
     skip_latents, _, _, _ = sde_step_with_logprob(
         temp_skip_scheduler,
         noise_pred.float(),
@@ -312,13 +313,21 @@ def skip_predict_rewards(self, accelerator, temp_skip_scheduler, reward_fn, rewa
         latents.float(),
         noise_level=0,
     )
+    predict_x0_end = time.time()
+    # if accelerator.is_main_process:
+    #     print(f'预测干净latent耗时{predict_x0_end - predict_x0_start}')
 
+    predict_i0_start = time.time()
     skip_latents = (skip_latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
     skip_latents = skip_latents.to(dtype=self.vae.dtype)
     skip_images = self.vae.decode(skip_latents, return_dict=False)[0]
 
     skip_images = self.image_processor.postprocess(skip_images, output_type='latent')
+    predict_i0_end = time.time()
+    # if accelerator.is_main_process:
+    #     print(f'生成干净image耗时{predict_i0_end - predict_i0_start}')
 
+    predict_r_start = time.time()
     skip_rewards = executor.submit(reward_fn, skip_images, prompts, prompt_metadata, only_strict=True)
     time.sleep(0)
     skip_rewards, _ = skip_rewards.result()
@@ -326,7 +335,10 @@ def skip_predict_rewards(self, accelerator, temp_skip_scheduler, reward_fn, rewa
     if isinstance(skip_rewards, list):
         skip_rewards = torch.tensor(skip_rewards, device=accelerator.device)
     if isinstance(skip_rewards, np.ndarray):
-        skip_rewards = torch.from_numpy(skip_rewards, device=accelerator.device)
+        skip_rewards = torch.from_numpy(skip_rewards).to(accelerator.device)
+    predict_r_end = time.time()
+    # if accelerator.is_main_process:
+    #     print(f'预测奖励耗时{predict_r_end - predict_r_start}')
 
     return skip_rewards
 
@@ -428,6 +440,7 @@ def pipeline_with_logprob_hcy(
     else:
         batch_size = prompt_embeds.shape[0]
 
+    assert self._execution_device == accelerator.device, 'self._execution_device 与 accelerator.device不一致'
     device = self._execution_device
 
     lora_scale = (
@@ -495,8 +508,8 @@ def pipeline_with_logprob_hcy(
 
     # 7. Denoising loop
     with self.progress_bar(total=num_inference_steps) as progress_bar:
-        num_paded = 0
         for i, t in enumerate(timesteps):
+            i_denoise_start = time.time()
             if self.interrupt:
                 continue
 
@@ -556,12 +569,17 @@ def pipeline_with_logprob_hcy(
 
             # if accelerator is not None and i == timestep_to_prune: # 后续调整
             prune_start_time = time.time()
+            assert prompt_ids is not None, "prompt_ids 不能为空（分布式剪枝流程依赖它来对齐 prompts）"
             if accelerator is not None and i in skip_timesteps:
                 skip_t_index = skip_timesteps.index(i)
                 temp_skip_scheduler = skip_scheduler_list[skip_t_index]
 
                 # 在gather前先在每个进程计算skip_rewards
+                predict_image_start = time.time()
                 skip_rewards = skip_predict_rewards(self, accelerator, temp_skip_scheduler, reward_fn, reward_name, executor, prompts, prompt_metadata, noise_pred, latents_before, t)
+                predict_image_end = time.time()
+                # if accelerator.is_main_process:
+                #     print(f'第{i}步预测图片耗时{predict_image_end - predict_image_start}')
 
                 # CFG只在上面的prompt_embeds添加了，所以后续重新编码prompt_embeds时候确实要手动添加neg_prompt_embed
                 neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
@@ -575,92 +593,45 @@ def pipeline_with_logprob_hcy(
                     if skip_t_index == len(skip_timesteps) - 1:
                         assert left_total % num_processes == 0, f"最后的 left_total={left_total} 不能被 num_processes={num_processes} 整除；会影响训练"
                         
-                remainder = left_total % num_processes
-                # if remainder != 0:
-                #     print(
-                #         f"left_total={left_total} 不能被 num_processes={num_processes} 整除；"
-                #         f"无法平均分配（余数={remainder})。将进行不均匀分配。",
-                #     )
                 base_num_per_process = left_total // num_processes
-
-                all_latents_tensor = torch.stack(all_latents, dim=1) # [latents.shape[0], len(all_latents), 16, 64, 64]
-                all_log_probs_tensor = torch.stack(all_log_probs, dim=1) # [latents.shape[0], len(all_log_probs)]
-
-                # 编码prompt_metadata
-                # prompt_metadata = [clean_dict(metadata) for metadata in prompt_metadata]
-                local_metadata_strs = [json.dumps(metadata) for metadata in prompt_metadata]
-                metadata_ids = tokenizers[0]( # [batch_size, 1024]，这里的tokenizer会引发单双引号的变化且额外空格的出现
-                    local_metadata_strs,
-                    padding="max_length",
-                    max_length=1024,
-                    truncation=True,
-                    return_tensors="pt",
-                ).input_ids.to(accelerator.device)
-                
+                remainder = left_total % num_processes
 
                 # 收集
-                if num_paded != 0:
-                    latents = accelerator.pad_across_processes([latents], dim=0)[0]
-                    log_prob = accelerator.pad_across_processes([log_prob], dim=0)[0]
-                    all_latents_tensor = accelerator.pad_across_processes([all_latents_tensor], dim=0)[0]
-                    all_log_probs_tensor = accelerator.pad_across_processes([all_log_probs_tensor], dim=0)[0]
-                    prompt_ids = accelerator.pad_across_processes([prompt_ids], dim=0)[0]
-                    metadata_ids = accelerator.pad_across_processes([metadata_ids], dim=0)[0]
-                    skip_rewards = accelerator.pad_across_processes([skip_rewards], dim=0)[0]
+                before_pad_bs = prompt_ids.shape[0]
+                paded_prompt_ids = accelerator.pad_across_processes([prompt_ids], dim=0)[0]
+                skip_rewards = accelerator.pad_across_processes([skip_rewards], dim=0)[0]
+                after_pad_bs = paded_prompt_ids.shape[0]
 
-                latents_world = accelerator.gather(latents).to(accelerator.device) # 我认为是[num_processes * latents.shape[0], 16, 64, 64]
-                log_probs_world = accelerator.gather(log_prob).to(accelerator.device) # [num_processes * latents.shape[0]]   
-                all_latents_tensor_world = accelerator.gather(all_latents_tensor).to(accelerator.device) # [num_process * latents.shape[0], len(all_latents), 16, 64, 64]         
-                all_log_probs_tensor_world = accelerator.gather(all_log_probs_tensor).to(accelerator.device) # [num_process * latents.shape[0], len(all_log_probs)]
+                local_bs = torch.tensor([before_pad_bs], device=accelerator.device)
+                all_bs = accelerator.gather(local_bs).squeeze() # shape [num_processes]
 
                 # accelerator gather不了prompts，所以gather prompt_ids然后解码
-                prompt_ids_world = accelerator.gather(prompt_ids).to(accelerator.device)
-                metadata_ids_world = accelerator.gather(metadata_ids).to(accelerator.device)
+                prompt_ids_world = accelerator.gather(paded_prompt_ids).to(accelerator.device)
 
                 skip_rewards_world = accelerator.gather(skip_rewards).to(accelerator.device)
 
-                if num_paded !=0:
-                    assert latents_world.shape[0] % num_processes == 0, '总gather数不能整除num_process，难道是pad没作用？'
-                    block_size = latents_world.shape[0] // num_processes
-                    valid_indices = []
-                    for r in range(num_processes):
-                        block_start = r * block_size
-                        if r < num_processes - num_paded:
-                            # Full block is valid
-                            valid_indices.extend(range(block_start, block_start + block_size))
-                        else:
-                            # Exclude the last padded element
-                            valid_indices.extend(range(block_start, block_start + block_size - 1))
+                # 去除pad
+                block_size = after_pad_bs
+                valid_indices = []
+                for r in range(num_processes):
+                    block_start = r * block_size
+                    proc_bs = all_bs[r].item()
+                    valid_indices.extend(range(block_start, block_start + proc_bs))
 
-                    valid_indices_tensor = torch.tensor(valid_indices, device=accelerator.device)
+                valid_indices_tensor = torch.tensor(valid_indices, device=accelerator.device)
 
-                    # Apply index_select to remove pads from each gathered tensor
-                    latents_world = latents_world.index_select(dim=0, index=valid_indices_tensor)
-                    log_probs_world = log_probs_world.index_select(dim=0, index=valid_indices_tensor)
-                    all_latents_tensor_world = all_latents_tensor_world.index_select(dim=0, index=valid_indices_tensor)
-                    all_log_probs_tensor_world = all_log_probs_tensor_world.index_select(dim=0, index=valid_indices_tensor)
-                    prompt_ids_world = prompt_ids_world.index_select(dim=0, index=valid_indices_tensor)
-                    metadata_ids_world = metadata_ids_world.index_select(dim=0, index=valid_indices_tensor)
-                    skip_rewards_world = skip_rewards_world.index_select(dim=0, index=valid_indices_tensor)
+                # Apply index_select to remove pads from each gathered tensor
+                prompt_ids_world = prompt_ids_world.index_select(dim=0, index=valid_indices_tensor)
+                skip_rewards_world = skip_rewards_world.index_select(dim=0, index=valid_indices_tensor)
 
-                prompts_world = self.tokenizer.batch_decode(
+                prompts_world = tokenizers[0].batch_decode(
                     prompt_ids_world, skip_special_tokens=True
                 )
-                metadata_str_world = self.tokenizer.batch_decode(
-                    metadata_ids_world, skip_special_tokens=True
-                )
-                metadata_world = [json.loads(json_str) for json_str in metadata_str_world]
-                metadata_world = [clean_dict(meta_data) for meta_data in metadata_world]
 
                 prompt_positions = find_prompt_positions_defaultdict(prompts_world)
 
-                left_latents_world = []
-                left_log_probs_world = []
-                left_all_latents_tensor_world = []
-                left_all_log_probs_tensor_world = []
-                left_prompts_world = []
-                left_prompt_metadatas_world = []
 
+                left_indices_world = []
                 for prompt, positions in prompt_positions.items(): # 逐prompt剪枝
                     # left_per_prompt = len(positions) - num_to_delete_per_prompt
                     left_per_prompt = lefts[skip_t_index]
@@ -672,52 +643,123 @@ def pipeline_with_logprob_hcy(
                     # p_left_index = skip_pruning(self, accelerator, skip_scheduler_list[skip_t_index], reward_fn, reward_name, executor, prompt, metadata_world, p_noise_pred, p_latents_before, left_per_prompt, t, height, width)
                     p_left_index, _ = heuristic_max_var_indices(p_skip_rewards, left_per_prompt)
 
-                    selected_index_world = torch.tensor([positions[index] for index in p_left_index], device=accelerator.device)
+                    selected_index_world = [positions[index] for index in p_left_index]
+                    left_indices_world.extend(selected_index_world)
+                left_indices_world = torch.tensor(left_indices_world, device=accelerator.device)
+                left_indices_world, _ = torch.sort(left_indices_world)
 
-                    left_latents_world.append(latents_world.index_select(0, selected_index_world))
-                    left_log_probs_world.append(log_probs_world.index_select(0, selected_index_world))
-                    left_all_latents_tensor_world.append(all_latents_tensor_world.index_select(0, selected_index_world))
-                    left_all_log_probs_tensor_world.append(all_log_probs_tensor_world.index_select(0, selected_index_world))
-                    left_prompts_world.extend([prompt] * left_per_prompt)
-                    left_prompt_metadatas_world.extend([metadata_world[select_index] for select_index in selected_index_world])
+                del prompt_ids_world
+                del skip_rewards_world
+                torch.cuda.empty_cache() 
 
-                left_latents_world = torch.cat(left_latents_world, dim=0)
-                left_log_probs_world = torch.cat(left_log_probs_world, dim=0)
-                left_all_latents_tensor_world = torch.cat(left_all_latents_tensor_world, dim=0)
-                left_all_log_probs_tensor_world = torch.cat(left_all_log_probs_tensor_world, dim=0)
-                    
-                # shuffle时保证所有进程的shuffle相同！
-                g = torch.Generator(device=accelerator.device)
-                g.manual_seed(42 + epoch)
-                shuffle_idx = torch.randperm(left_total, generator=g, device=accelerator.device)
+                all_bs_cpu = all_bs.cpu()
+                offsets = torch.cumsum(torch.cat([torch.tensor([0.], device='cpu'), all_bs_cpu[:-1]]), dim=0).tolist()
+                per_process_local = [[] for _ in range(num_processes)]
+                total_bs = all_bs.sum().item()  # 验证
+                for global_idx in left_indices_world.cpu().numpy():  # CPU loop 快
+                    if global_idx >= total_bs:
+                        continue  # OOB skip (罕见)
+                    # 找 r: offsets[r] <= global_idx < offsets[r+1]
+                    r = bisect.bisect_right(offsets, global_idx) - 1
+                    local_idx = global_idx - offsets[r]
+                    per_process_local[r].append(int(local_idx))  # int for tensor
+                my_local_indices = torch.tensor(per_process_local[accelerator.process_index], device=accelerator.device)
 
-                left_latents_world = left_latents_world[shuffle_idx]
-                left_log_probs_world = left_log_probs_world[shuffle_idx]
-                left_all_latents_tensor_world = left_all_latents_tensor_world[shuffle_idx]
-                left_all_log_probs_tensor_world = left_all_log_probs_tensor_world[shuffle_idx]
-                left_prompts_world = [left_prompts_world[s.item()] for s in shuffle_idx]
-                left_prompt_metadatas_world = [left_prompt_metadatas_world[s.item()] for s in shuffle_idx]
+                prompts = [prompts[index.item()] for index in my_local_indices]
+                prompt_metadata = [prompt_metadata[index.item()] for index in my_local_indices]
+                prompt_ids = prompt_ids.index_select(0, my_local_indices)
+                latents = latents.index_select(0, my_local_indices)
+                log_prob = log_prob.index_select(0, my_local_indices)
 
-                # 分配
+                all_latents_tensor = torch.stack(all_latents, dim=1)
+                all_log_probs_tensor = torch.stack(all_log_probs, dim=1)
+                all_latents_tensor = all_latents_tensor.index_select(0, my_local_indices)
+                all_log_probs_tensor = all_log_probs_tensor.index_select(0, my_local_indices)
+
+                if len(prompt_metadata) == 0:
+                    metadata_ids = torch.empty((0, 1024), dtype=torch.long, device=accelerator.device)
+                else:
+                    local_metadata_strs = [json.dumps(metadata) for metadata in prompt_metadata]
+                    metadata_ids = tokenizers[0](
+                        local_metadata_strs,
+                        padding="max_length",
+                        max_length=1024,
+                        truncation=True,
+                        return_tensors="pt",
+                    ).input_ids.to(accelerator.device)
+
+                
+                before_pad_bs_2 = len(per_process_local[accelerator.process_index])
+                latents = accelerator.pad_across_processes([latents], dim=0)[0]
+                log_prob = accelerator.pad_across_processes([log_prob], dim=0)[0]
+                all_latents_tensor = accelerator.pad_across_processes([all_latents_tensor], dim=0)[0]
+                all_log_probs_tensor = accelerator.pad_across_processes([all_log_probs_tensor], dim=0)[0]
+                prompt_ids = accelerator.pad_across_processes([prompt_ids], dim=0)[0]
+                metadata_ids = accelerator.pad_across_processes([metadata_ids], dim=0)[0]
+                after_pad_bs_2 = latents.shape[0]
+
+
+                latents_world = accelerator.gather(latents).to(accelerator.device)
+                log_probs_world = accelerator.gather(log_prob).to(accelerator.device)  
+                all_latents_tensor_world = accelerator.gather(all_latents_tensor).to(accelerator.device)        
+                all_log_probs_tensor_world = accelerator.gather(all_log_probs_tensor).to(accelerator.device)
+                prompt_ids_world = accelerator.gather(prompt_ids).to(accelerator.device)
+                metadata_ids_world = accelerator.gather(metadata_ids).to(accelerator.device)
+
+                local_bs_2 = torch.tensor([before_pad_bs_2], device=accelerator.device)
+                all_bs_2 = accelerator.gather(local_bs_2).squeeze()
+
+                # 去除pad
+                block_size_2 = after_pad_bs_2
+                valid_indices_2 = []
+                for r in range(num_processes):
+                    block_start_2 = r * block_size_2
+                    proc_bs_2 = all_bs_2[r].item()
+                    valid_indices_2.extend(range(block_start_2, block_start_2 + proc_bs_2))
+
+                valid_indices_tensor_2 = torch.tensor(valid_indices_2, device=accelerator.device)
+
+
+                latents_world = latents_world.index_select(0, valid_indices_tensor_2)
+                log_probs_world = log_probs_world.index_select(0, valid_indices_tensor_2)
+                all_latents_tensor_world = all_latents_tensor_world.index_select(0, valid_indices_tensor_2)
+                all_log_probs_tensor_world = all_log_probs_tensor_world.index_select(0, valid_indices_tensor_2)
+                prompt_ids_world = prompt_ids_world.index_select(0, valid_indices_tensor_2)
+                metadata_ids_world = metadata_ids_world.index_select(0, valid_indices_tensor_2)
+
+                prompts_world = tokenizers[0].batch_decode(
+                    prompt_ids_world, skip_special_tokens=True
+                )
+                metadata_str_world = tokenizers[0].batch_decode(
+                    metadata_ids_world, skip_special_tokens=True
+                )
+                metadata_world = [json.loads(json_str) for json_str in metadata_str_world]
+                metadata_world = [clean_dict(meta_data) for meta_data in metadata_world]
+                
+
+                assert base_num_per_process == latents_world.shape[0] // num_processes, f'预估的{base_num_per_process}与每个进程实际要被分配到{latents_world.shape[0] // num_processes}不一致'
                 rank = accelerator.process_index
                 num_elements_for_this_process = base_num_per_process + (1 if rank < remainder else 0)
                 start_idx = sum(base_num_per_process + (1 if r < remainder else 0) for r in range(rank))
                 # num_elements_for_this_process = base_num_per_process
                 # start_idx = sum(base_num_per_process for _ in range(rank))
                 end_idx = start_idx + num_elements_for_this_process
-                latents = left_latents_world[start_idx: end_idx]
-                log_prob = left_log_probs_world[start_idx: end_idx]
-                all_latents_tensor = left_all_latents_tensor_world[start_idx: end_idx]
+                latents = latents_world[start_idx: end_idx]
+                log_prob = log_probs_world[start_idx: end_idx]
+                all_latents_tensor = all_latents_tensor_world[start_idx: end_idx]
                 all_latents = list(torch.unbind(all_latents_tensor, dim=1))
-                all_log_probs_tensor = left_all_log_probs_tensor_world[start_idx: end_idx]
+                all_log_probs_tensor = all_log_probs_tensor_world[start_idx: end_idx]
                 all_log_probs = list(torch.unbind(all_log_probs_tensor, dim=1))
-                prompts = left_prompts_world[start_idx: end_idx]
-                prompt_metadata = left_prompt_metadatas_world[start_idx: end_idx]
+                prompts = prompts_world[start_idx: end_idx]
+                prompt_metadata = metadata_world[start_idx: end_idx]
 
-                if remainder != 0:
-                    num_paded = num_processes - remainder
-                else: 
-                    num_paded = 0
+                del all_latents_tensor
+                del all_log_probs_tensor
+                del latents_world
+                del log_probs_world
+                del all_latents_tensor_world
+                del all_log_probs_tensor_world
+                torch.cuda.empty_cache() 
 
                 # 重编码prompt_ids和prompt_embeds，以及注意CFG！
                 prompt_embeds, pooled_prompt_embeds = compute_text_embeddings( 
@@ -735,8 +777,8 @@ def pipeline_with_logprob_hcy(
                     return_tensors="pt",
                 ).input_ids.to(accelerator.device)
 
-                sample_neg_prompt_embeds = neg_prompt_embed.repeat(num_elements_for_this_process, 1, 1)
-                sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(num_elements_for_this_process, 1)
+                sample_neg_prompt_embeds = neg_prompt_embed.repeat(prompt_embeds.shape[0], 1, 1)
+                sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(prompt_embeds.shape[0], 1)
 
                 if self.do_classifier_free_guidance:
                     prompt_embeds = torch.cat([sample_neg_prompt_embeds, prompt_embeds], dim=0)
@@ -744,16 +786,12 @@ def pipeline_with_logprob_hcy(
 
                 prune_end_time = time.time()
                 prune_time = prune_end_time - prune_start_time
-                # print(f'第{i}步的剪枝总时间：{prune_time:.6f}秒')
+                if accelerator.is_main_process:
+                    print(f'第{i}步的剪枝总时间：{prune_time:.6f}秒')
 
-                del latents_world
-                del log_probs_world
-                del all_log_probs_tensor_world
-                del all_latents_tensor_world
-                del prompt_ids_world
-                del metadata_ids_world
-                del skip_rewards_world
-                torch.cuda.empty_cache() 
+            i_denoise_end = time.time()
+            # if accelerator.is_main_process:
+            #     print(f'第{i}步去噪耗时{i_denoise_end - i_denoise_start}')
             
             # call the callback, if provided
             if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
