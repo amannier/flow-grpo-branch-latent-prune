@@ -431,7 +431,7 @@ def geneval_sd3_new_48_to_12_bs_4_48_gpu():
 
 
 def geneval_sd3_new_48_to_12_bs_4_72_gpu():
-    gpu_number = 48
+    gpu_number = 72
     config = compressibility()
     config.dataset = os.path.join(os.getcwd(), "dataset/geneval")
 
