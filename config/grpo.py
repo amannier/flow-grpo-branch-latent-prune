@@ -25,6 +25,9 @@ def compressibility():
     # rewards
     config.reward_fn = {"jpeg_compressibility": 1}
     config.per_prompt_stat_tracking = True
+
+    # resume from checkpoint
+    config.resume_from = None  # str or None
     return config
 
 def general_ocr_wan2_1():

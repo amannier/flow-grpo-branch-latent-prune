@@ -354,6 +354,38 @@ def save_ckpt(save_dir, transformer, global_step, accelerator, ema, transformer_
         if config.train.ema:
             ema.copy_temp_to(transformer_trainable_parameters)
 
+def save_ckpt_our(save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config, epoch, optimizer):  # 新增 optimizer 和 epoch 参数
+    save_root = os.path.join(save_dir, "checkpoints", f"checkpoint-{global_step}")
+    save_root_lora = os.path.join(save_root, "lora")
+    os.makedirs(save_root_lora, exist_ok=True)
+    if accelerator.is_main_process:
+        if config.train.ema:
+            ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
+        unwrap_model(transformer, accelerator).save_pretrained(save_root_lora)
+        if config.train.ema:
+            ema.copy_temp_to(transformer_trainable_parameters)
+        
+        # 3. 保存优化器的状态（使用 torch.save）
+        optimizer_state_dict = optimizer.state_dict()
+        torch.save(optimizer_state_dict, os.path.join(save_root, "optimizer.pt"))
+
+        # 4. 保存训练的随机状态（如果有）
+        # 这部分包含了 PyTorch 和其他库的 RNG 状态
+        random_state = {
+            'torch': torch.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            'numpy': np.random.get_state()
+        }
+        torch.save(random_state, os.path.join(save_root, "random_states.pt"))
+        
+        # 新增：额外保存 EMA 状态（如果启用）
+        if config.train.ema:
+            torch.save(ema.state_dict(), os.path.join(save_root, "ema_state.pt"))
+        
+        # 新增：保存额外元数据，如 epoch（可选，但有助于调试）
+        metadata = {"epoch": epoch, "global_step": global_step}
+        torch.save(metadata, os.path.join(save_root, "metadata.pt"))
+
 def main(_):
     # basic Accelerate and logging setup
     config = FLAGS.config
@@ -460,12 +492,21 @@ def main(_):
             # After loading with PeftModel.from_pretrained, all parameters have requires_grad set to False. You need to call set_adapter to enable gradients for the adapter parameters.
             pipeline.transformer.set_adapter("default")
         else:
-            pipeline.transformer = get_peft_model(pipeline.transformer, transformer_lora_config)
+            if config.resume_from is None:
+                pipeline.transformer = get_peft_model(pipeline.transformer, transformer_lora_config)
+            else:
+                lora_path = os.path.join(config.resume_from, 'lora')
+                pipeline.transformer = PeftModel.from_pretrained(pipeline.transformer, lora_path)
+                pipeline.transformer.set_adapter("default")
     
     transformer = pipeline.transformer
     transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
     # This ema setting affects the previous 20 × 8 = 160 steps on average.
     ema = EMAModuleWrapper(transformer_trainable_parameters, decay=0.9, update_step_interval=8, device=accelerator.device)
+
+    if config.resume_from is not None:
+        # 恢复 EMA
+        ema.load_state_dict(torch.load(os.path.join(config.resume_from, "ema_state.pt")))
     
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -492,6 +533,9 @@ def main(_):
         weight_decay=config.train.adam_weight_decay,
         eps=config.train.adam_epsilon,
     )
+
+    if config.resume_from is not None:
+        optimizer.load_state_dict(torch.load(os.path.join(config.resume_from, "optimizer.pt")))
 
     # prepare prompt and reward fn
     reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
@@ -620,6 +664,21 @@ def main(_):
     global_step = 0
     train_iter = iter(train_dataloader)
 
+    if config.resume_from is not None:
+        # 恢复随机状态
+        random_state = torch.load(os.path.join(config.resume_from, "random_states.pt"), weights_only=False)
+        torch.set_rng_state(random_state['torch'])
+        np.random.set_state(random_state['numpy'])
+        if torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(random_state['cuda'])
+
+        # 恢复元数据
+        metadata = torch.load(os.path.join(config.resume_from, "metadata.pt"), weights_only=False)
+        epoch = metadata["epoch"]
+        global_step = metadata["global_step"]
+   
+        print(f"Resumed from checkpoint: {config.resume_from} at global_step={global_step}, epoch={epoch}")
+
     # # 定义scorer
     # if config.pretrained.reward_model == 'pickscore':
     #     from flow_grpo.pickscore_scorer import PickScoreScorer
@@ -650,10 +709,12 @@ def main(_):
     while True:
         #################### EVAL ####################
         pipeline.transformer.eval()
-        if epoch % config.eval_freq == 0:
-            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
+        # if epoch % config.eval_freq == 0:
+            # eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
         if epoch % config.save_freq == 0 and epoch > 0 and accelerator.is_main_process:
-            save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
+            # save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
+            print(f'Epoch {epoch} start saving...')
+            save_ckpt_our(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config, epoch, optimizer)
 
         if accelerator.is_main_process:
             gpu_hours = calculate_gpu_hours(accelerator)

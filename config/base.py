@@ -118,4 +118,8 @@ def get_config():
     ###### Per-Prompt Stat Tracking ######
     config.per_prompt_stat_tracking = True
 
+    ###### Resume from Checkpoint ######
+    # Optional: Path to the checkpoint folder to resume from. If None, start from scratch.
+    config.resume_from = None  # str or None
+
     return config
