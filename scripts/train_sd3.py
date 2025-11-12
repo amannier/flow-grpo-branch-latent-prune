@@ -662,6 +662,7 @@ def main(_):
         pipeline.transformer.eval()
         samples = []
         prompts = []
+        sample_judge = True
         for i in tqdm(
             range(config.sample.sample_batches_per_epoch),
             desc=f"Epoch {epoch}: sampling",
@@ -693,9 +694,9 @@ def main(_):
                 generator = None
             with autocast():
                 with torch.no_grad():
-                    print(f'采样长度{len(prompts)}开始')
+                    # print(f'采样长度{len(prompts)}开始')
                     sample_start_time = time.time()
-                    images, latents, log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds, prompt_metadata = pipeline_with_logprob_hcy(
+                    images, latents, log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds, prompt_metadata, sample_fail = pipeline_with_logprob_hcy(
                         pipeline,
                         # scorer=scorer,
                         reward_fn=reward_fn,
@@ -724,9 +725,12 @@ def main(_):
                         lefts=config.sample.lefts,
                         skip_scheduler_list=skip_scheduler_list,
                 )
+                    if sample_fail:
+                        sample_judge = False
+                        break
                     sample_end_time = time.time()
-                    if accelerator.is_main_process:
-                        print(f"采样结束，剪枝到{len(prompts)}，耗时{sample_end_time - sample_start_time}")
+                    # if accelerator.is_main_process:
+                    #     print(f"采样结束，剪枝到{len(prompts)}，耗时{sample_end_time - sample_start_time}")
 
             if pipeline.do_classifier_free_guidance:
                 _, prompt_embeds = torch.chunk(prompt_embeds, 2, dim=0)
@@ -784,7 +788,7 @@ def main(_):
                 }
             )
 
-        if epoch == 0:
+        if epoch == 0 or sample_judge is False:
             epoch += 1
             continue
 

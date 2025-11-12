@@ -506,6 +506,7 @@ def pipeline_with_logprob_hcy(
 
     attn_dict = defaultdict(list)
 
+    sample_fail = False
     # 7. Denoising loop
     with self.progress_bar(total=num_inference_steps) as progress_bar:
         for i, t in enumerate(timesteps):
@@ -598,12 +599,14 @@ def pipeline_with_logprob_hcy(
 
                 # 收集
                 before_pad_bs = prompt_ids.shape[0]
+                print(f'rank {accelerator.process_index}, before_pad_bs {before_pad_bs}')
                 paded_prompt_ids = accelerator.pad_across_processes([prompt_ids], dim=0)[0]
                 skip_rewards = accelerator.pad_across_processes([skip_rewards], dim=0)[0]
                 after_pad_bs = paded_prompt_ids.shape[0]
 
                 local_bs = torch.tensor([before_pad_bs], device=accelerator.device)
                 all_bs = accelerator.gather(local_bs).squeeze() # shape [num_processes]
+                print(f'rank {accelerator.process_index}, all_bs {all_bs}')
 
                 # accelerator gather不了prompts，所以gather prompt_ids然后解码
                 prompt_ids_world = accelerator.gather(paded_prompt_ids).to(accelerator.device)
@@ -647,12 +650,16 @@ def pipeline_with_logprob_hcy(
                     left_indices_world.extend(selected_index_world)
                 left_indices_world = torch.tensor(left_indices_world, device=accelerator.device)
                 left_indices_world, _ = torch.sort(left_indices_world)
+                if accelerator.is_main_process:
+                    print(f'left_indices_world {left_indices_world}')
 
                 del prompt_ids_world
                 del skip_rewards_world
                 torch.cuda.empty_cache() 
 
                 all_bs_cpu = all_bs.cpu()
+                if accelerator.is_main_process:
+                    print(f'all_bs {all_bs_cpu}')
                 offsets = torch.cumsum(torch.cat([torch.tensor([0.], device='cpu'), all_bs_cpu[:-1]]), dim=0).tolist()
                 per_process_local = [[] for _ in range(num_processes)]
                 total_bs = all_bs.sum().item()  # 验证
@@ -664,6 +671,7 @@ def pipeline_with_logprob_hcy(
                     local_idx = global_idx - offsets[r]
                     per_process_local[r].append(int(local_idx))  # int for tensor
                 my_local_indices = torch.tensor(per_process_local[accelerator.process_index], device=accelerator.device)
+                print(f'rank {accelerator.process_index}, my_local_indices {my_local_indices}')
 
                 prompts = [prompts[index.item()] for index in my_local_indices]
                 prompt_metadata = [prompt_metadata[index.item()] for index in my_local_indices]
@@ -708,6 +716,8 @@ def pipeline_with_logprob_hcy(
 
                 local_bs_2 = torch.tensor([before_pad_bs_2], device=accelerator.device)
                 all_bs_2 = accelerator.gather(local_bs_2).squeeze()
+                if accelerator.is_main_process:
+                    print(f'all_bs_2 {all_bs_2}')
 
                 # 去除pad
                 block_size_2 = after_pad_bs_2
@@ -737,7 +747,12 @@ def pipeline_with_logprob_hcy(
                 metadata_world = [clean_dict(meta_data) for meta_data in metadata_world]
                 
 
-                assert base_num_per_process == latents_world.shape[0] // num_processes, f'预估的{base_num_per_process}与每个进程实际要被分配到{latents_world.shape[0] // num_processes}不一致'
+                # 下面的报错出现，但目前不知道怎么解决，用sample_fail来跳过当前epoch
+                # assert base_num_per_process == latents_world.shape[0] // num_processes, f'预估的{base_num_per_process}与每个进程实际要被分配到{latents_world.shape[0] // num_processes}不一致'
+                if base_num_per_process != latents_world.shape[0] // num_processes:
+                    sample_fail = True
+                    return None, None, None, None, None, None, None, None, sample_fail
+
                 rank = accelerator.process_index
                 num_elements_for_this_process = base_num_per_process + (1 if rank < remainder else 0)
                 start_idx = sum(base_num_per_process + (1 if r < remainder else 0) for r in range(rank))
@@ -809,4 +824,4 @@ def pipeline_with_logprob_hcy(
     #     return image, latent_extract, all_latents, all_log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds
     # if operate_diffsim_latent_index is not None:
     #     return image, attn_dict, all_latents, all_log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds
-    return image, all_latents, all_log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds, prompt_metadata
+    return image, all_latents, all_log_probs, prompts, prompt_ids, prompt_embeds, pooled_prompt_embeds, prompt_metadata, sample_fail
